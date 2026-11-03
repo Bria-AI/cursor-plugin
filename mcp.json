@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "bria": {
+      "url": "https://mcp.prod.bria-api.com/mcp"
+    }
+  }
+}
