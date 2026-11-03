@@ -1,0 +1,171 @@
+#!/bin/bash
+# bria_client.sh — Self-contained helper for Bria API calls.
+# Zero dependencies beyond curl, base64, sed (standard on macOS/Linux).
+#
+# Usage:
+#   source bria_client.sh
+#   RESULT=$(bria_call /v2/image/generate "" '"prompt":"a sunset","aspect_ratio":"16:9","sync":true')
+#   RESULT=$(bria_call /v2/image/edit/remove_background "/path/to/image.png")
+#   RESULT=$(bria_call /v2/image/edit/replace_background "https://example.com/img.jpg" '"prompt":"sunset beach"')
+#   RESULT=$(bria_call /v2/image/edit "/path/to/image.png" --key images '"instruction":"make it red"')
+#   RESULT=$(bria_call /v2/image/edit "https://example.com/man.jpg" --key images \
+#     --image "https://example.com/santa.png" \
+#     '"instruction":"dress the man in image 1 in the santa outfit from image 2"')
+#   RESULT=$(bria_call /v2/image/edit/product/holding "/path/to/person.jpg" --key person_image \
+#     --array-key product_images --image "https://example.com/product.png" \
+#     '"instruction":"logo facing the camera"')
+#
+# Each extra --image adds the next reference image, in order: the positional image is "image 1",
+# the first --image is "image 2", and so on. Only the images array (--key images) takes references
+# under that same key. Use --array-key <name> when the endpoint keys the main image and its
+# references separately (e.g. person_image + product_images) — the positional image is sent under
+# --key, and every --image goes into the --array-key array instead.
+#
+# BRIA_API_KEY is auto-loaded from ~/.bria/credentials if not already set.
+
+BRIA_API_BASE="${BRIA_API_BASE:-https://engine.prod.bria-api.com}"
+BRIA_USER_AGENT="BriaSkills/1.4.0"
+
+bria_call() {
+  local endpoint image key array_key extra payload result http_code body url status_url poll i img
+  local references=()
+  endpoint="$1"; image="$2"; shift 2
+
+  key="image"; array_key=""; extra=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --key) key="$2"; shift 2 ;;
+      --array-key) array_key="$2"; shift 2 ;;
+      --image) references+=("$2"); shift 2 ;;
+      *) extra="${extra:+$extra, }$1"; shift ;;
+    esac
+  done
+
+  if [ -z "$BRIA_API_KEY" ] && [ -f "$HOME/.bria/credentials" ]; then
+    BRIA_API_KEY=$(grep '^api_token=' "$HOME/.bria/credentials" | cut -d= -f2-)
+  fi
+  [ -z "$BRIA_API_KEY" ] && { echo "ERROR: BRIA_API_KEY not set. Run auth first." >&2; return 1; }
+
+  # --- Build JSON payload to temp file (safe for large images) ---
+  payload="/tmp/bria_payload_$$.json"
+
+  if [ -z "$image" ]; then
+    printf '{' > "$payload"
+  elif [ "$key" = "images" ]; then
+    # Written one entry at a time, in argument order: the array position is how the instruction
+    # addresses each image ("image 1", "image 2"), so nothing here may reorder them.
+    printf '{"images": [' > "$payload"
+    i=0
+    # ${arr[@]+"${arr[@]}"} expands to nothing for an empty array instead of failing under `set -u`.
+    for img in "$image" ${references[@]+"${references[@]}"}; do
+      [ "$i" -gt 0 ] && printf ', ' >> "$payload"
+      if printf '%s' "$img" | grep -qE '^https?://'; then
+        printf '"%s"' "$img" >> "$payload"
+      else
+        [ ! -f "$img" ] && { echo "ERROR: File not found: $img" >&2; return 1; }
+        printf '"' >> "$payload"
+        base64 < "$img" | tr -d '\n' >> "$payload"
+        printf '"' >> "$payload"
+      fi
+      i=$((i + 1))
+    done
+    printf ']' >> "$payload"
+  elif [ -n "$array_key" ]; then
+    # Main image and its references are keyed separately (e.g. person_image + product_images).
+    if printf '%s' "$image" | grep -qE '^https?://'; then
+      printf '{"%s": "%s"' "$key" "$image" > "$payload"
+    else
+      [ ! -f "$image" ] && { echo "ERROR: File not found: $image" >&2; return 1; }
+      printf '{"%s": "' "$key" > "$payload"
+      base64 < "$image" | tr -d '\n' >> "$payload"
+      printf '"' >> "$payload"
+    fi
+    printf ', "%s": [' "$array_key" >> "$payload"
+    i=0
+    for img in ${references[@]+"${references[@]}"}; do
+      [ "$i" -gt 0 ] && printf ', ' >> "$payload"
+      if printf '%s' "$img" | grep -qE '^https?://'; then
+        printf '"%s"' "$img" >> "$payload"
+      else
+        [ ! -f "$img" ] && { echo "ERROR: File not found: $img" >&2; return 1; }
+        printf '"' >> "$payload"
+        base64 < "$img" | tr -d '\n' >> "$payload"
+        printf '"' >> "$payload"
+      fi
+      i=$((i + 1))
+    done
+    printf ']' >> "$payload"
+  elif printf '%s' "$image" | grep -qE '^https?://'; then
+    printf '{"%s": "%s"' "$key" "$image" > "$payload"
+  else
+    [ ! -f "$image" ] && { echo "ERROR: File not found: $image" >&2; return 1; }
+    printf '{"%s": "' "$key" > "$payload"
+    base64 < "$image" | tr -d '\n' >> "$payload"
+    printf '"' >> "$payload"
+  fi
+
+  if [ -n "$extra" ]; then
+    if [ -z "$image" ]; then
+      printf '%s' "$extra" >> "$payload"
+    else
+      printf ', %s' "$extra" >> "$payload"
+    fi
+  fi
+  printf '}' >> "$payload"
+
+  # --- API call ---
+  result="/tmp/bria_result_$$.json"
+  http_code=$(curl -s -o "$result" -w '%{http_code}' -X POST \
+    "${BRIA_API_BASE}${endpoint}" \
+    -H "api_token: $BRIA_API_KEY" \
+    -H "Content-Type: application/json" \
+    -H "User-Agent: $BRIA_USER_AGENT" \
+    -d @"$payload")
+
+  body=$(cat "$result")
+  rm -f "$payload" "$result"
+
+  # --- Error handling ---
+  case "$http_code" in
+    401) echo "ERROR 401: API key invalid. Delete ~/.bria/credentials and re-authenticate." >&2; return 1 ;;
+    403) echo "ERROR 403: Billing/quota issue. Visit https://platform.bria.ai/pricing" >&2; echo "$body" >&2; return 1 ;;
+    5*) echo "ERROR $http_code: Server error. Try again shortly." >&2; return 1 ;;
+  esac
+
+  if [ "${http_code:-0}" -ge 400 ] 2>/dev/null; then
+    echo "ERROR $http_code: $body" >&2; return 1
+  fi
+
+  # --- Extract result URL (sync response) ---
+  url=$(printf '%s' "$body" | sed -n 's/.*"result_url" *: *"\([^"]*\)".*/\1/p')
+  [ -n "$url" ] && { echo "$url"; return 0; }
+  url=$(printf '%s' "$body" | sed -n 's/.*"image_url" *: *"\([^"]*\)".*/\1/p')
+  [ -n "$url" ] && { echo "$url"; return 0; }
+  # Multi-image results (e.g. product_dimensions output_format=dual) use "image_urls": [...].
+  url=$(printf '%s' "$body" | sed -n 's/.*"image_urls" *: *\[ *"\([^"]*\)".*/\1/p')
+  [ -n "$url" ] && { echo "$url"; return 0; }
+
+  # --- Async: poll status_url ---
+  status_url=$(printf '%s' "$body" | sed -n 's/.*"status_url" *: *"\([^"]*\)".*/\1/p')
+  if [ -n "$status_url" ]; then
+    i=0
+    while [ "$i" -lt 30 ]; do
+      sleep 3
+      poll=$(curl -s "$status_url" \
+        -H "api_token: $BRIA_API_KEY" \
+        -H "User-Agent: $BRIA_USER_AGENT")
+      if printf '%s' "$poll" | grep -qE '"status" *: *"(ERROR|FAILED)"'; then
+        echo "ERROR: Job failed. Response: $poll" >&2; return 1
+      fi
+      url=$(printf '%s' "$poll" | sed -n 's/.*"result_url" *: *"\([^"]*\)".*/\1/p')
+      [ -z "$url" ] && url=$(printf '%s' "$poll" | sed -n 's/.*"image_url" *: *"\([^"]*\)".*/\1/p')
+      [ -z "$url" ] && url=$(printf '%s' "$poll" | sed -n 's/.*"image_urls" *: *\[ *"\([^"]*\)".*/\1/p')
+      [ -n "$url" ] && { echo "$url"; return 0; }
+      i=$((i + 1))
+    done
+    echo "ERROR: Polling timed out after 90 seconds" >&2
+    return 1
+  fi
+
+  echo "$body"
+}
