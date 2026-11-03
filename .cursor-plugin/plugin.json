@@ -1,0 +1,12 @@
+{
+  "name": "bria",
+  "displayName": "Bria",
+  "version": "1.0.0",
+  "description": "Commercially licensed image generation and editing with IP indemnification. Generate and edit images with FIBO 2.0, remove backgrounds and more.",
+  "author": { "name": "Bria AI", "url": "https://bria.ai" },
+  "homepage": "https://docs.bria.ai/mcp-authentication",
+  "repository": "https://github.com/Bria-AI/cursor-plugin",
+  "license": "MIT",
+  "logo": "assets/logo.png",
+  "keywords": ["image generation", "image editing", "background removal", "FIBO", "MCP"]
+}
